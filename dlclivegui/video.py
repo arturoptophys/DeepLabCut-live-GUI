@@ -10,7 +10,14 @@ import os
 import numpy as np
 import pandas as pd
 import cv2
-import colorcet as cc
+try:
+    import colorcet as cc
+    COLORCET_AVAILABLE = True
+except ImportError:
+    # Fallback to matplotlib colormaps for compatibility
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    COLORCET_AVAILABLE = False
 from PIL import ImageColor
 from tqdm import tqdm
 
@@ -20,7 +27,7 @@ def create_labeled_video(
     out_dir=None,
     dlc_online=True,
     save_images=False,
-    cut=(0, np.Inf),
+    cut=(0, np.inf),
     crop=None,
     cmap="bmy",
     radius=3,
@@ -139,11 +146,30 @@ def create_labeled_video(
     poses = poses.melt(id_vars=["frame_time", "pose_time"])
     bodyparts = poses["bodyparts"].unique()
 
-    all_colors = getattr(cc, cmap)
-    colors = [
-        ImageColor.getcolor(c, "RGB")[::-1]
-        for c in all_colors[:: int(len(all_colors) / bodyparts.size)]
-    ]
+    if COLORCET_AVAILABLE:
+        all_colors = getattr(cc, cmap)
+        colors = [
+            ImageColor.getcolor(c, "RGB")[::-1]
+            for c in all_colors[:: int(len(all_colors) / bodyparts.size)]
+        ]
+    else:
+        # Fallback to matplotlib colormaps
+        cmap_map = {
+            'bgy': 'viridis',
+            'kbc': 'cool',
+            'bmw': 'gray',
+            'bmy': 'plasma',
+            'kgy': 'cividis',
+            'fire': 'hot'
+        }
+        cmap_name = cmap_map.get(cmap, 'viridis')
+        cmap_obj = cm.get_cmap(cmap_name)
+        colors = []
+        for i in range(bodyparts.size):
+            rgba = cmap_obj(i / max(bodyparts.size - 1, 1))
+            # Convert to BGR format for OpenCV
+            rgb = tuple(int(c * 255) for c in rgba[:3])
+            colors.append(rgb[::-1])  # RGB to BGR
 
     ind = 0
     vid_time = 0
@@ -240,7 +266,7 @@ def main():
     parser.add_argument("-o", "--out-dir", type=str, default=None)
     parser.add_argument("--dlc-offline", action="store_true")
     parser.add_argument("-s", "--save-images", action="store_true")
-    parser.add_argument("-u", "--cut", nargs="+", type=float, default=[0, np.Inf])
+    parser.add_argument("-u", "--cut", nargs="+", type=float, default=[0, np.inf])
     parser.add_argument("-c", "--crop", nargs="+", type=int, default=None)
     parser.add_argument("-m", "--cmap", type=str, default="bmy")
     parser.add_argument("-r", "--radius", type=int, default=3)

@@ -30,9 +30,15 @@ import datetime
 import inspect
 import importlib
 
-import numpy as np
 from PIL import Image, ImageTk, ImageDraw
-import colorcet as cc
+try:
+    import colorcet as cc
+    COLORCET_AVAILABLE = True
+except ImportError:
+    # Fallback to matplotlib colormaps for compatibility
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    COLORCET_AVAILABLE = False
 
 from dlclivegui import CameraPoseProcess
 from dlclivegui import processor
@@ -271,7 +277,9 @@ class DLCLiveGUI(object):
         self.cam_type = StringVar(add_cam)
 
         cam_types = [c[0] for c in inspect.getmembers(camera, inspect.isclass)]
+        print(cam_types)
         cam_types = [c for c in cam_types if (c != "Camera") & ("Error" not in c)]
+        
 
         type_entry = Combobox(add_cam, textvariable=self.cam_type, state="readonly")
         type_entry["values"] = tuple(cam_types)
@@ -442,8 +450,29 @@ class DLCLiveGUI(object):
             the number of keypoints
         """
 
-        all_colors = getattr(cc, self.display_cmap)
-        self.display_colors = all_colors[:: int(len(all_colors) / bodyparts)]
+        if COLORCET_AVAILABLE:
+            all_colors = getattr(cc, self.display_cmap)
+            self.display_colors = all_colors[:: int(len(all_colors) / bodyparts)]
+        else:
+            # Fallback to matplotlib colormaps
+            cmap_map = {
+                'bgy': 'viridis',
+                'kbc': 'cool',
+                'bmw': 'gray',
+                'bmy': 'plasma',
+                'kgy': 'cividis',
+                'fire': 'hot'
+            }
+            cmap_name = cmap_map.get(self.display_cmap, 'viridis')
+            cmap = cm.get_cmap(cmap_name)
+            # Generate evenly spaced colors
+            self.display_colors = []
+            for i in range(bodyparts):
+                rgba = cmap(i / max(bodyparts - 1, 1))
+                # Convert to hex color string
+                rgb = tuple(int(c * 255) for c in rgba[:3])
+                hex_color = '#{:02x}{:02x}{:02x}'.format(*rgb)
+                self.display_colors.append(hex_color)
 
     def display_frame(self):
         """ Display a frame in display window
@@ -467,6 +496,7 @@ class DLCLiveGUI(object):
                 )
 
                 if pose is not None:
+
                     im_size = (frame.shape[1], frame.shape[0])
 
                     if not self.display_colors:
@@ -592,6 +622,7 @@ class DLCLiveGUI(object):
             self.edit_dlc_settings(True)
 
     def edit_dlc_settings(self, new=False):
+
         if new:
             cur_set = self.empty_dlc_settings()
         else:
@@ -645,7 +676,7 @@ class DLCLiveGUI(object):
         Combobox(
             self.dlc_settings_window,
             textvariable=self.dlc_settings_model_type,
-            value=["pytorch"],
+            value=["base", "tensorrt", "tflite"],
             state="readonly",
         ).grid(sticky="nsew", row=cur_row, column=1)
         cur_row += 1
@@ -725,7 +756,7 @@ class DLCLiveGUI(object):
         return {
             "name": "",
             "model_path": "",
-            "model_type": "pytorch",
+            "model_type": "base",
             "precision": "FP32",
             "cropping": "",
             "dynamic": "False, 0.5, 10",
@@ -734,11 +765,12 @@ class DLCLiveGUI(object):
         }
 
     def browse_dlc_path(self):
-        """ Open file browser to select DLC exported model directory """
+        """ Open file browser to select DLC exported model directory
+        """
 
-        new_dlc_path = filedialog.askopenfile(parent=self.dlc_settings_window)
+        new_dlc_path = filedialog.askdirectory(parent=self.dlc_settings_window)
         if new_dlc_path:
-            self.dlc_settings_model_path.set(new_dlc_path.name)
+            self.dlc_settings_model_path.set(new_dlc_path)
 
     def update_dlc_settings(self):
         """ Update DLC settings for the current dlc option from DLC Settings GUI
@@ -792,7 +824,6 @@ class DLCLiveGUI(object):
                 "DLC Settings Error", warn_msg, parent=self.dlc_settings_window
             )
 
-        # CREATES DLC OPTIONS
         self.cfg["dlc_options"][self.dlc_settings_name.get()] = {
             "model_path": self.dlc_settings_model_path.get(),
             "model_type": self.dlc_settings_model_type.get(),
@@ -1014,22 +1045,13 @@ class DLCLiveGUI(object):
         ### get default args: load module and read arguments ###
 
         self.proc_object = getattr(self.dlc_proc_module, self.dlc_proc_name.get())
-        sig = inspect.signature(self.proc_object)
-        parameter_names = [param.name for param_name, param in sig.parameters.items()]
-        parameter_default_values = [
-            param.default
-            for param_name, param in sig.parameters.items()
-            if param.default != inspect.Parameter.empty
-        ]
-
-        def_args = parameter_names
-        self.proc_param_names = parameter_names
-        self.proc_param_default_values = parameter_default_values
+        def_args = inspect.getargspec(self.proc_object)
+        self.proc_param_names = def_args[0]
+        self.proc_param_default_values = def_args[3]
         self.proc_param_default_types = [
-            type(v) if type(v) is not list else [type(v[0])]
-            for v in parameter_default_values
+            type(v) if type(v) is not list else [type(v[0])] for v in def_args[3]
         ]
-        for i in range(len(parameter_names) - len(parameter_default_values)):
+        for i in range(len(def_args[0]) - len(def_args[3])):
             self.proc_param_default_values = ("",) + self.proc_param_default_values
             self.proc_param_default_types = [str] + self.proc_param_default_types
 
@@ -1063,9 +1085,7 @@ class DLCLiveGUI(object):
             }
 
         proc_args_gui = SettingsWindow(
-            title="DLC Processor Settings",
-            settings=proc_args_dict,
-            parent=self.window,
+            title="DLC Processor Settings", settings=proc_args_dict, parent=self.window
         )
         proc_args_gui.mainloop()
 

@@ -15,6 +15,10 @@ if platform.system() == "Windows":
     try:
         from dlclivegui.camera.tiscamera_windows import TISCam
     except Exception as e:
+        try:
+            from dlclivegui.camera.tiscamera_gentl import TISCamGenTL as TISCam
+        except Exception as e:
+            print(f"Error importing TISCam on Windows: {e}")
         pass
 
 if platform.system() == "Linux":
