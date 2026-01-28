@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import logging
 import os
+import threading
 import time
 from typing import Iterable, List, Optional, Tuple
 
@@ -25,6 +26,120 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - optional dependency
     Harvester = None  # type: ignore
     HarvesterTimeoutError = TimeoutError  # type: ignore
+
+
+class _SharedHarvester:
+    """Singleton manager for shared Harvester instance.
+    
+    GenTL requires a single Harvester instance to properly enumerate and
+    manage multiple cameras. This class provides thread-safe access to a
+    shared Harvester with reference counting for proper cleanup.
+    """
+    
+    _instance: Optional["_SharedHarvester"] = None
+    _lock = threading.Lock()
+    
+    def __init__(self):
+        self._harvester: Optional[Harvester] = None
+        self._cti_file: Optional[str] = None
+        self._ref_count = 0
+        self._harvester_lock = threading.Lock()
+    
+    @classmethod
+    def get_instance(cls) -> "_SharedHarvester":
+        """Get the singleton instance."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+    
+    def acquire(self, cti_file: str) -> Harvester:
+        """Acquire a reference to the shared Harvester.
+        
+        If this is the first reference, creates and initializes the Harvester.
+        If Harvester exists but with different CTI file, raises an error.
+        
+        Returns:
+            The shared Harvester instance.
+        """
+        with self._harvester_lock:
+            if self._harvester is None:
+                if Harvester is None:
+                    raise RuntimeError(
+                        "The 'harvesters' package is required for the GenTL backend. "
+                        "Install it via 'pip install harvesters'."
+                    )
+                self._harvester = Harvester()
+                self._harvester.add_file(cti_file)
+                self._harvester.update()
+                self._cti_file = cti_file
+                LOG.info(f"Shared Harvester initialized with CTI: {cti_file}")
+            elif self._cti_file != cti_file:
+                # Different CTI file requested - this could cause issues
+                LOG.warning(
+                    f"Harvester already initialized with '{self._cti_file}', "
+                    f"ignoring request for '{cti_file}'"
+                )
+            
+            self._ref_count += 1
+            LOG.debug(f"Harvester reference count: {self._ref_count}")
+            return self._harvester
+    
+    def release(self) -> None:
+        """Release a reference to the shared Harvester.
+        
+        When the last reference is released, the Harvester is reset and cleaned up.
+        """
+        with self._harvester_lock:
+            if self._ref_count > 0:
+                self._ref_count -= 1
+                LOG.debug(f"Harvester reference count: {self._ref_count}")
+            
+            if self._ref_count == 0 and self._harvester is not None:
+                try:
+                    self._harvester.reset()
+                    LOG.info("Shared Harvester reset and cleaned up")
+                except Exception as e:
+                    LOG.warning(f"Error resetting Harvester: {e}")
+                finally:
+                    self._harvester = None
+                    self._cti_file = None
+    
+    def get_device_count(self, cti_file: str) -> int:
+        """Get device count without acquiring a permanent reference.
+        
+        Used for device enumeration/checking availability.
+        """
+        with self._harvester_lock:
+            # If harvester already exists, just return current count
+            if self._harvester is not None:
+                return len(self._harvester.device_info_list)
+            
+            # Otherwise, create temporary harvester for enumeration
+            if Harvester is None:
+                return -1
+            
+            temp_harvester = None
+            try:
+                temp_harvester = Harvester()
+                temp_harvester.add_file(cti_file)
+                temp_harvester.update()
+                return len(temp_harvester.device_info_list)
+            except Exception:
+                return -1
+            finally:
+                if temp_harvester is not None:
+                    try:
+                        temp_harvester.reset()
+                    except Exception:
+                        pass
+    
+    def update_device_list(self) -> None:
+        """Update the device list on the shared Harvester."""
+        with self._harvester_lock:
+            if self._harvester is not None:
+                self._harvester.update()
 
 
 class GenTLCameraBackend(CameraBackend):
@@ -59,7 +174,8 @@ class GenTLCameraBackend(CameraBackend):
             props.get("resolution")
         )
 
-        self._harvester = None
+        self._shared_harvester: Optional[_SharedHarvester] = None
+        self._harvester: Optional[Harvester] = None  # Reference to shared harvester
         self._acquirer = None
         self._device_label: Optional[str] = None
 
@@ -76,26 +192,14 @@ class GenTLCameraBackend(CameraBackend):
         if Harvester is None:
             return -1
 
-        harvester = None
-        try:
-            harvester = Harvester()
-            # Use the static helper to find CTI file with default patterns
-            cti_file = cls._search_cti_file(cls._DEFAULT_CTI_PATTERNS)
-
-            if not cti_file:
-                return -1
-
-            harvester.add_file(cti_file)
-            harvester.update()
-            return len(harvester.device_info_list)
-        except Exception:
+        # Use the static helper to find CTI file with default patterns
+        cti_file = cls._search_cti_file(cls._DEFAULT_CTI_PATTERNS)
+        if not cti_file:
             return -1
-        finally:
-            if harvester is not None:
-                try:
-                    harvester.reset()
-                except Exception:
-                    pass
+
+        # Use shared harvester for device count
+        shared = _SharedHarvester.get_instance()
+        return shared.get_device_count(cti_file)
 
     def open(self) -> None:
         if Harvester is None:  # pragma: no cover - optional dependency
@@ -104,10 +208,10 @@ class GenTLCameraBackend(CameraBackend):
                 "Install it via 'pip install harvesters'."
             )
 
-        self._harvester = Harvester()
+        # Use shared Harvester instance for multi-camera support
         cti_file = self._cti_file or self._find_cti_file()
-        self._harvester.add_file(cti_file)
-        self._harvester.update()
+        self._shared_harvester = _SharedHarvester.get_instance()
+        self._harvester = self._shared_harvester.acquire(cti_file)
 
         if not self._harvester.device_info_list:
             raise RuntimeError("No GenTL cameras detected via Harvesters")
@@ -216,11 +320,11 @@ class GenTLCameraBackend(CameraBackend):
             finally:
                 self._acquirer = None
 
-        if self._harvester is not None:
-            try:
-                self._harvester.reset()
-            finally:
-                self._harvester = None
+        # Release reference to shared Harvester (don't reset it directly)
+        if self._shared_harvester is not None:
+            self._shared_harvester.release()
+            self._shared_harvester = None
+        self._harvester = None
 
         self._device_label = None
 
