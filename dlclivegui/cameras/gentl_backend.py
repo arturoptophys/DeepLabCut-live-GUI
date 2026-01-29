@@ -174,6 +174,16 @@ class GenTLCameraBackend(CameraBackend):
             props.get("resolution")
         )
 
+        # Trigger mode settings
+        # trigger_mode: "freerun" (default), "triggered", or "off"/"on" for explicit control
+        self._trigger_mode: str = str(props.get("trigger_mode", "freerun")).lower()
+        # trigger_source: e.g., "Line0", "Line1", "Software" (default: "Line0" for triggered mode)
+        self._trigger_source: str = props.get("trigger_source", "Line0")
+        # trigger_activation: "RisingEdge", "FallingEdge", "AnyEdge", "LevelHigh", "LevelLow"
+        self._trigger_activation: str = props.get("trigger_activation", "RisingEdge")
+        # trigger_selector: "FrameStart", "ExposureStart", "ExposureActive" (default: "FrameStart")
+        self._trigger_selector: str = props.get("trigger_selector", "FrameStart")
+
         self._shared_harvester: Optional[_SharedHarvester] = None
         self._harvester: Optional[Harvester] = None  # Reference to shared harvester
         self._acquirer = None
@@ -271,6 +281,7 @@ class GenTLCameraBackend(CameraBackend):
         self._configure_exposure(node_map)
         self._configure_gain(node_map)
         self._configure_frame_rate(node_map)
+        self._configure_trigger_mode(node_map)
 
         self._acquirer.start()
 
@@ -299,6 +310,36 @@ class GenTLCameraBackend(CameraBackend):
         frame = self._convert_frame(frame)
         timestamp = time.time()
         return frame, timestamp
+
+    def set_trigger_mode(self, mode: str) -> None:
+        """Change trigger mode at runtime.
+
+        Args:
+            mode: "freerun" or "off" for continuous acquisition,
+                  "triggered" or "on" for external trigger mode.
+
+        Note: Camera must be opened first. This will briefly stop and restart
+        acquisition to apply the new trigger settings.
+        """
+        if self._acquirer is None:
+            raise RuntimeError("Camera not opened. Call open() first.")
+
+        self._trigger_mode = mode.lower()
+
+        # Stop acquisition to change trigger settings
+        try:
+            self._acquirer.stop()
+        except Exception:
+            pass
+
+        # Get node map and reconfigure trigger
+        remote = self._acquirer.remote_device
+        node_map = remote.node_map
+        self._configure_trigger_mode(node_map)
+
+        # Restart acquisition
+        self._acquirer.start()
+        LOG.info(f"Trigger mode changed to '{mode}'")
 
     def stop(self) -> None:
         if self._acquirer is not None:
@@ -657,6 +698,153 @@ class GenTLCameraBackend(CameraBackend):
                 continue
 
         LOG.warning(f"Could not set frame rate to {target} FPS (no compatible attribute found)")
+
+    def _configure_trigger_mode(self, node_map) -> None:
+        """Configure camera trigger mode for freerun or external triggering.
+
+        Trigger modes:
+            - "freerun" or "off": Camera runs in free-running mode (self-timed acquisition)
+            - "triggered" or "on": Camera waits for external trigger signal
+
+        For triggered mode, configures:
+            - TriggerSelector: Which event to trigger (default: FrameStart)
+            - TriggerSource: Input line for trigger (default: Line0)
+            - TriggerActivation: Edge type (default: RisingEdge)
+            - TriggerMode: On
+
+        Properties used from settings.properties:
+            - trigger_mode: "freerun", "triggered", "on", "off"
+            - trigger_source: "Line0", "Line1", "Software", etc.
+            - trigger_activation: "RisingEdge", "FallingEdge", "AnyEdge", "LevelHigh", "LevelLow"
+            - trigger_selector: "FrameStart", "ExposureStart", "ExposureActive"
+        """
+        mode = self._trigger_mode
+
+        # Normalize mode names
+        if mode in ("freerun", "free", "off", "continuous"):
+            enable_trigger = False
+        elif mode in ("triggered", "trigger", "on", "external", "hardware"):
+            enable_trigger = True
+        else:
+            LOG.warning(f"Unknown trigger mode '{mode}', defaulting to freerun")
+            enable_trigger = False
+
+        if not enable_trigger:
+            # Set to freerun mode (disable trigger)
+            self._set_trigger_off(node_map)
+            return
+
+        # Enable triggered mode
+        self._set_trigger_on(node_map)
+
+    def _set_trigger_off(self, node_map) -> None:
+        """Disable trigger mode (freerun/continuous acquisition)."""
+        try:
+            # First try to set TriggerSelector if available
+            if hasattr(node_map, "TriggerSelector"):
+                try:
+                    node_map.TriggerSelector.value = self._trigger_selector
+                except Exception as e:
+                    LOG.debug(f"Could not set TriggerSelector: {e}")
+
+            # Disable trigger mode
+            if hasattr(node_map, "TriggerMode"):
+                try:
+                    node_map.TriggerMode.value = "Off"
+                    LOG.info("Trigger mode set to Off (freerun)")
+                except Exception as e:
+                    LOG.warning(f"Failed to disable TriggerMode: {e}")
+            else:
+                LOG.debug("TriggerMode not available, camera may already be in freerun mode")
+
+        except Exception as e:
+            LOG.warning(f"Error configuring freerun mode: {e}")
+
+    def _set_trigger_on(self, node_map) -> None:
+        """Enable external trigger mode with configured settings."""
+        try:
+            # Step 1: Set TriggerSelector (which event to trigger)
+            if hasattr(node_map, "TriggerSelector"):
+                available_selectors = []
+                try:
+                    available_selectors = list(node_map.TriggerSelector.symbolics)
+                except Exception:
+                    pass
+
+                if self._trigger_selector in available_selectors:
+                    node_map.TriggerSelector.value = self._trigger_selector
+                    LOG.info(f"TriggerSelector set to '{self._trigger_selector}'")
+                elif available_selectors:
+                    # Use first available if requested not available
+                    node_map.TriggerSelector.value = available_selectors[0]
+                    LOG.warning(
+                        f"TriggerSelector '{self._trigger_selector}' not available, "
+                        f"using '{available_selectors[0]}'. Available: {available_selectors}"
+                    )
+
+            # Step 2: Set TriggerSource (where trigger signal comes from)
+            if hasattr(node_map, "TriggerSource"):
+                available_sources = []
+                try:
+                    available_sources = list(node_map.TriggerSource.symbolics)
+                except Exception:
+                    pass
+
+                if self._trigger_source in available_sources:
+                    node_map.TriggerSource.value = self._trigger_source
+                    LOG.info(f"TriggerSource set to '{self._trigger_source}'")
+                elif available_sources:
+                    # Try common hardware trigger sources
+                    for fallback in ["Line0", "Line1", "Line2", "CC1"]:
+                        if fallback in available_sources:
+                            node_map.TriggerSource.value = fallback
+                            LOG.warning(
+                                f"TriggerSource '{self._trigger_source}' not available, "
+                                f"using '{fallback}'. Available: {available_sources}"
+                            )
+                            break
+                    else:
+                        LOG.warning(
+                            f"Could not set TriggerSource. Available: {available_sources}"
+                        )
+
+            # Step 3: Set TriggerActivation (edge type)
+            if hasattr(node_map, "TriggerActivation"):
+                available_activations = []
+                try:
+                    available_activations = list(node_map.TriggerActivation.symbolics)
+                except Exception:
+                    pass
+
+                if self._trigger_activation in available_activations:
+                    node_map.TriggerActivation.value = self._trigger_activation
+                    LOG.info(f"TriggerActivation set to '{self._trigger_activation}'")
+                elif available_activations:
+                    # Default to RisingEdge if available
+                    if "RisingEdge" in available_activations:
+                        node_map.TriggerActivation.value = "RisingEdge"
+                        LOG.warning(
+                            f"TriggerActivation '{self._trigger_activation}' not available, "
+                            f"using 'RisingEdge'. Available: {available_activations}"
+                        )
+                    else:
+                        LOG.warning(
+                            f"Could not set TriggerActivation. Available: {available_activations}"
+                        )
+
+            # Step 4: Enable TriggerMode
+            if hasattr(node_map, "TriggerMode"):
+                node_map.TriggerMode.value = "On"
+                LOG.info(
+                    f"Trigger mode enabled: selector={self._trigger_selector}, "
+                    f"source={self._trigger_source}, activation={self._trigger_activation}"
+                )
+            else:
+                LOG.warning("TriggerMode not available, cannot enable external triggering")
+
+        except Exception as e:
+            LOG.error(f"Failed to configure trigger mode: {e}")
+            raise RuntimeError(f"Failed to enable external trigger: {e}")
 
     def _convert_frame(self, frame: np.ndarray) -> np.ndarray:
         if frame.dtype != np.uint8:
