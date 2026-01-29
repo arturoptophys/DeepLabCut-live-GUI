@@ -11,8 +11,6 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
-os.environ["PYLON_CAMEMU"] = "2"
-
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
@@ -50,11 +48,13 @@ from dlclivegui.config import (
     CameraSettings,
     DLCProcessorSettings,
     MultiCameraSettings,
+    OpenEphysSettings,
     RecordingSettings,
     VisualizationSettings,
 )
 from dlclivegui.dlc_processor import DLCLiveProcessor, PoseResult, ProcessorStats
 from dlclivegui.multi_camera_controller import MultiCameraController, MultiFrameData, get_camera_id
+from dlclivegui.openephys_controller import OpenEphysController, OpenEphysRecordingSequencer
 from dlclivegui.processors.processor_utils import instantiate_from_scan, scan_processor_folder
 from dlclivegui.video_recorder import RecorderStats, VideoRecorder
 
@@ -115,6 +115,12 @@ class MainWindow(QMainWindow):
 
         self.multi_camera_controller = MultiCameraController()
         self.dlc_processor = DLCLiveProcessor()
+
+        # OpenEphys remote control
+        self.openephys_controller = OpenEphysController(self)
+        self.openephys_sequencer = OpenEphysRecordingSequencer(
+            self.openephys_controller, ttl_delay_ms=1000, parent=self
+        )
 
         # Multi-camera state
         self._multi_camera_mode = False
@@ -405,6 +411,48 @@ class MainWindow(QMainWindow):
         self.crf_spin.setValue(23)
         form.addRow("CRF", self.crf_spin)
 
+        # OpenEphys remote control section
+        self.openephys_enabled_checkbox = QCheckBox("Ctrl OpenEphys")
+        self.openephys_enabled_checkbox.setChecked(False)
+        self.openephys_enabled_checkbox.setToolTip(
+            "Enable remote control of OpenEphys recording via HTTP API"
+        )
+
+        # OpenEphys host and port
+        openephys_layout = QHBoxLayout()
+        self.openephys_host_edit = QLineEdit("localhost")
+        self.openephys_host_edit.setMaximumWidth(120)
+        self.openephys_host_edit.setPlaceholderText("localhost")
+        openephys_layout.addWidget(QLabel("Host:"))
+        openephys_layout.addWidget(self.openephys_host_edit)
+        self.openephys_port_spin = QSpinBox()
+        self.openephys_port_spin.setRange(1, 65535)
+        self.openephys_port_spin.setValue(37497)
+        openephys_layout.addWidget(QLabel("Port:"))
+        openephys_layout.addWidget(self.openephys_port_spin)
+        openephys_layout.addStretch(1)
+
+        # TTL settings
+        ttl_layout = QHBoxLayout()
+        self.openephys_ttl_line_spin = QSpinBox()
+        self.openephys_ttl_line_spin.setRange(1, 8)
+        self.openephys_ttl_line_spin.setValue(1)
+        self.openephys_ttl_line_spin.setToolTip("Digital output line for TTL pulse")
+        ttl_layout.addWidget(QLabel("TTL Line:"))
+        ttl_layout.addWidget(self.openephys_ttl_line_spin)
+        self.openephys_ttl_duration_spin = QSpinBox()
+        self.openephys_ttl_duration_spin.setRange(1, 10000)
+        self.openephys_ttl_duration_spin.setValue(500)
+        self.openephys_ttl_duration_spin.setSuffix(" ms")
+        self.openephys_ttl_duration_spin.setToolTip("TTL pulse duration in milliseconds")
+        ttl_layout.addWidget(QLabel("Duration:"))
+        ttl_layout.addWidget(self.openephys_ttl_duration_spin)
+        ttl_layout.addStretch(1)
+
+        form.addRow(self.openephys_enabled_checkbox)
+        form.addRow("OpenEphys", openephys_layout)
+        form.addRow("TTL", ttl_layout)
+
         # Wrap recording buttons in a widget to prevent shifting
         recording_button_widget = QWidget()
         buttons = QHBoxLayout(recording_button_widget)
@@ -498,6 +546,12 @@ class MainWindow(QMainWindow):
         self.dlc_processor.error.connect(self._on_dlc_error)
         self.dlc_processor.initialized.connect(self._on_dlc_initialised)
 
+        # OpenEphys sequencer signals
+        self.openephys_sequencer.start_video_recording.connect(self._start_multi_camera_recording)
+        self.openephys_sequencer.stop_video_recording.connect(self._stop_multi_camera_recording)
+        self.openephys_sequencer.error.connect(self._on_openephys_error)
+        self.openephys_controller.error.connect(self._on_openephys_error)
+
     # ------------------------------------------------------------------ config
     def _apply_config(self, config: ApplicationSettings) -> None:
         # Update active cameras label
@@ -519,6 +573,23 @@ class MainWindow(QMainWindow):
             self.codec_combo.addItem(recording.codec)
             self.codec_combo.setCurrentIndex(self.codec_combo.count() - 1)
         self.crf_spin.setValue(int(recording.crf))
+
+        # Set OpenEphys settings from config
+        openephys = config.openephys
+        self.openephys_enabled_checkbox.setChecked(openephys.enabled)
+        self.openephys_host_edit.setText(openephys.host)
+        self.openephys_port_spin.setValue(openephys.port)
+        self.openephys_ttl_line_spin.setValue(openephys.ttl_line)
+        self.openephys_ttl_duration_spin.setValue(openephys.ttl_duration)
+
+        # Configure OpenEphys controller
+        self.openephys_controller.enabled = openephys.enabled
+        self.openephys_controller.configure(
+            host=openephys.host,
+            port=openephys.port,
+            ttl_line=openephys.ttl_line,
+            ttl_duration=openephys.ttl_duration,
+        )
 
         # Set bounding box settings from config
         bbox = config.bbox
@@ -546,6 +617,7 @@ class MainWindow(QMainWindow):
             recording=self._recording_settings_from_ui(),
             bbox=self._bbox_settings_from_ui(),
             visualization=self._visualization_settings_from_ui(),
+            openephys=self._openephys_settings_from_ui(),
         )
 
     def _parse_json(self, value: str) -> dict:
@@ -590,6 +662,15 @@ class MainWindow(QMainWindow):
             p_cutoff=self._p_cutoff,
             colormap=self._colormap,
             bbox_color=self._bbox_color,
+        )
+
+    def _openephys_settings_from_ui(self) -> OpenEphysSettings:
+        return OpenEphysSettings(
+            enabled=self.openephys_enabled_checkbox.isChecked(),
+            host=self.openephys_host_edit.text().strip() or "localhost",
+            port=self.openephys_port_spin.value(),
+            ttl_line=self.openephys_ttl_line_spin.value(),
+            ttl_duration=self.openephys_ttl_duration_spin.value(),
         )
 
     # ------------------------------------------------------------------ actions
@@ -1443,23 +1524,71 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ recording
     def _start_recording(self) -> None:
-        """Start recording from all active cameras."""
+        """Start recording from all active cameras.
+
+        If OpenEphys control is enabled:
+        1. Send RECORD command to OpenEphys
+        2. Start preview/video recording
+        3. After 1 second, send TTL pulse to mark recording start
+        """
         # Auto-start preview if not running
         if not self.multi_camera_controller.is_running():
             self._start_preview()
             # Wait a moment for cameras to initialize before recording
-            # The recording will start after preview is confirmed running
             self.statusBar().showMessage("Starting preview before recording...", 3000)
             # Use a single-shot timer to start recording after preview starts
-            QTimer.singleShot(500, self._start_multi_camera_recording)
+            QTimer.singleShot(500, self._continue_start_recording)
             return
 
         # Preview already running, start recording immediately
-        self._start_multi_camera_recording()
+        self._continue_start_recording()
+
+    def _continue_start_recording(self) -> None:
+        """Continue recording startup after preview is ready."""
+        # Update controller config from UI before starting
+        self._sync_openephys_controller_from_ui()
+
+        if self.openephys_enabled_checkbox.isChecked():
+            self.statusBar().showMessage("Starting OpenEphys synchronized recording...", 3000)
+            # Use sequencer for coordinated start
+            if not self.openephys_sequencer.start_recording_sequence():
+                # Failed to start OpenEphys, but video recording was not started
+                return
+            # Video recording will be started by sequencer signal
+        else:
+            # No OpenEphys control, start video recording directly
+            self._start_multi_camera_recording()
 
     def _stop_recording(self) -> None:
-        """Stop recording from all cameras."""
-        self._stop_multi_camera_recording()
+        """Stop recording from all cameras.
+
+        If OpenEphys control is enabled:
+        1. Send TTL pulse to mark recording end
+        2. After 1 second, stop video recording
+        3. Stop OpenEphys recording
+        """
+        if self.openephys_enabled_checkbox.isChecked():
+            self.statusBar().showMessage("Stopping OpenEphys synchronized recording...", 3000)
+            # Use sequencer for coordinated stop
+            self.openephys_sequencer.stop_recording_sequence()
+            # Video recording will be stopped by sequencer signal
+        else:
+            # No OpenEphys control, stop immediately
+            self._stop_multi_camera_recording()
+
+    def _sync_openephys_controller_from_ui(self) -> None:
+        """Sync OpenEphys controller configuration from UI values."""
+        self.openephys_controller.enabled = self.openephys_enabled_checkbox.isChecked()
+        self.openephys_controller.configure(
+            host=self.openephys_host_edit.text().strip() or "localhost",
+            port=self.openephys_port_spin.value(),
+            ttl_line=self.openephys_ttl_line_spin.value(),
+            ttl_duration=self.openephys_ttl_duration_spin.value(),
+        )
+
+    def _on_openephys_error(self, message: str) -> None:
+        """Handle OpenEphys controller errors."""
+        self._show_warning(message)
 
     def _on_pose_ready(self, result: PoseResult) -> None:
         if not self._dlc_active:

@@ -158,6 +158,17 @@ class VisualizationSettings:
 
 
 @dataclass
+class OpenEphysSettings:
+    """Configuration for OpenEphys remote control."""
+
+    enabled: bool = False
+    host: str = "localhost"
+    port: int = 37497
+    ttl_line: int = 1  # Digital output line for TTL pulse
+    ttl_duration: int = 500  # TTL pulse duration in milliseconds
+
+
+@dataclass
 class RecordingSettings:
     """Configuration for video recording."""
 
@@ -203,6 +214,7 @@ class ApplicationSettings:
     recording: RecordingSettings = field(default_factory=RecordingSettings)
     bbox: BoundingBoxSettings = field(default_factory=BoundingBoxSettings)
     visualization: VisualizationSettings = field(default_factory=VisualizationSettings)
+    openephys: OpenEphysSettings = field(default_factory=OpenEphysSettings)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ApplicationSettings":
@@ -238,6 +250,7 @@ class ApplicationSettings:
         recording = RecordingSettings(**recording_data)
         bbox = BoundingBoxSettings(**data.get("bbox", {}))
         visualization = VisualizationSettings(**data.get("visualization", {}))
+        openephys = OpenEphysSettings(**data.get("openephys", {}))
         return cls(
             camera=camera,
             multi_camera=multi_camera,
@@ -245,6 +258,7 @@ class ApplicationSettings:
             recording=recording,
             bbox=bbox,
             visualization=visualization,
+            openephys=openephys,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -257,6 +271,7 @@ class ApplicationSettings:
             "recording": asdict(self.recording),
             "bbox": asdict(self.bbox),
             "visualization": asdict(self.visualization),
+            "openephys": asdict(self.openephys),
         }
 
     @classmethod
