@@ -436,7 +436,7 @@ class MainWindow(QMainWindow):
         openephys_layout.addWidget(self.openephys_port_spin)
         openephys_layout.addStretch(1)
 
-        # Serial port and pulse frequency settings
+        # Serial port settings (pulse frequency will match camera FPS)
         teensy_layout = QHBoxLayout()
         self.teensy_serial_combo = QComboBox()
         self.teensy_serial_combo.setEditable(True)
@@ -444,22 +444,14 @@ class MainWindow(QMainWindow):
         # Populate with available ports
         available_ports = list_serial_ports()
         self.teensy_serial_combo.addItems(available_ports)
-        self.teensy_serial_combo.setToolTip("Serial port for Teensy pulse control")
+        self.teensy_serial_combo.setToolTip("Serial port for Teensy pulse control (frequency matches camera FPS)")
         teensy_layout.addWidget(QLabel("Serial:"))
         teensy_layout.addWidget(self.teensy_serial_combo)
-        
-        self.pulse_frequency_spin = QDoubleSpinBox()
-        self.pulse_frequency_spin.setRange(1.0, 10000.0)
-        self.pulse_frequency_spin.setValue(100.0)
-        self.pulse_frequency_spin.setSuffix(" Hz")
-        self.pulse_frequency_spin.setToolTip("Pulse frequency in Hz")
-        teensy_layout.addWidget(QLabel("Freq:"))
-        teensy_layout.addWidget(self.pulse_frequency_spin)
         teensy_layout.addStretch(1)
 
         form.addRow(self.openephys_enabled_checkbox)
         form.addRow("OpenEphys", openephys_layout)
-        form.addRow("Teensy Pulse", teensy_layout)
+        form.addRow("Teensy Serial", teensy_layout)
 
         # Wrap recording buttons in a widget to prevent shifting
         recording_button_widget = QWidget()
@@ -680,12 +672,24 @@ class MainWindow(QMainWindow):
         )
 
     def _openephys_settings_from_ui(self) -> OpenEphysSettings:
+        # Get pulse frequency from active camera FPS
+        pulse_frequency = 100.0  # Default fallback
+        if self._config.multi_camera.cameras:
+            # Use DLC camera if specified, otherwise first camera
+            if self._config.multi_camera.dlc_camera_id:
+                for cam in self._config.multi_camera.cameras:
+                    if get_camera_id(cam) == self._config.multi_camera.dlc_camera_id:
+                        pulse_frequency = int(cam.fps)
+                        break
+            else:
+                pulse_frequency = int(self._config.multi_camera.cameras[0].fps)
+        
         return OpenEphysSettings(
             enabled=self.openephys_enabled_checkbox.isChecked(),
             host=self.openephys_host_edit.text().strip() or "localhost",
             port=self.openephys_port_spin.value(),
             serial_port=self.teensy_serial_combo.currentText().strip(),
-            pulse_frequency=self.pulse_frequency_spin.value(),
+            pulse_frequency=pulse_frequency,
         )
 
     # ------------------------------------------------------------------ actions
@@ -1593,12 +1597,24 @@ class MainWindow(QMainWindow):
 
     def _sync_openephys_controller_from_ui(self) -> None:
         """Sync OpenEphys controller configuration from UI values."""
+        # Get pulse frequency from active camera FPS
+        pulse_frequency = 100.0  # Default fallback
+        if self._config.multi_camera.cameras:
+            # Use DLC camera if specified, otherwise first camera
+            if self._config.multi_camera.dlc_camera_id:
+                for cam in self._config.multi_camera.cameras:
+                    if get_camera_id(cam) == self._config.multi_camera.dlc_camera_id:
+                        pulse_frequency = float(cam.fps)
+                        break
+            else:
+                pulse_frequency = float(self._config.multi_camera.cameras[0].fps)
+        
         self.openephys_controller.enabled = self.openephys_enabled_checkbox.isChecked()
         self.openephys_controller.configure(
             host=self.openephys_host_edit.text().strip() or "localhost",
             port=self.openephys_port_spin.value(),
             serial_port=self.teensy_serial_combo.currentText().strip(),
-            pulse_frequency=self.pulse_frequency_spin.value(),
+            pulse_frequency=pulse_frequency,
         )
 
     def _on_openephys_error(self, message: str) -> None:
