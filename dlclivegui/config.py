@@ -159,13 +159,13 @@ class VisualizationSettings:
 
 @dataclass
 class OpenEphysSettings:
-    """Configuration for OpenEphys remote control."""
+    """Configuration for OpenEphys remote control and Teensy pulse control."""
 
     enabled: bool = False
     host: str = "localhost"
     port: int = 37497
-    ttl_line: int = 1  # Digital output line for TTL pulse
-    ttl_duration: int = 500  # TTL pulse duration in milliseconds
+    serial_port: str = ""  # COM port for Teensy (e.g., "COM3")
+    pulse_frequency: float = 100.0  # Pulse frequency in Hz
 
 
 @dataclass

@@ -54,7 +54,11 @@ from dlclivegui.config import (
 )
 from dlclivegui.dlc_processor import DLCLiveProcessor, PoseResult, ProcessorStats
 from dlclivegui.multi_camera_controller import MultiCameraController, MultiFrameData, get_camera_id
-from dlclivegui.openephys_controller import OpenEphysController, OpenEphysRecordingSequencer
+from dlclivegui.openephys_controller import (
+    OpenEphysController,
+    OpenEphysRecordingSequencer,
+    list_serial_ports,
+)
 from dlclivegui.processors.processor_utils import instantiate_from_scan, scan_processor_folder
 from dlclivegui.video_recorder import RecorderStats, VideoRecorder
 
@@ -412,10 +416,10 @@ class MainWindow(QMainWindow):
         form.addRow("CRF", self.crf_spin)
 
         # OpenEphys remote control section
-        self.openephys_enabled_checkbox = QCheckBox("Ctrl OpenEphys")
+        self.openephys_enabled_checkbox = QCheckBox("Ctrl OpenEphys + Teensy")
         self.openephys_enabled_checkbox.setChecked(False)
         self.openephys_enabled_checkbox.setToolTip(
-            "Enable remote control of OpenEphys recording via HTTP API"
+            "Enable remote control of OpenEphys recording via HTTP API and Teensy pulse via serial"
         )
 
         # OpenEphys host and port
@@ -432,26 +436,30 @@ class MainWindow(QMainWindow):
         openephys_layout.addWidget(self.openephys_port_spin)
         openephys_layout.addStretch(1)
 
-        # TTL settings
-        ttl_layout = QHBoxLayout()
-        self.openephys_ttl_line_spin = QSpinBox()
-        self.openephys_ttl_line_spin.setRange(1, 8)
-        self.openephys_ttl_line_spin.setValue(1)
-        self.openephys_ttl_line_spin.setToolTip("Digital output line for TTL pulse")
-        ttl_layout.addWidget(QLabel("TTL Line:"))
-        ttl_layout.addWidget(self.openephys_ttl_line_spin)
-        self.openephys_ttl_duration_spin = QSpinBox()
-        self.openephys_ttl_duration_spin.setRange(1, 10000)
-        self.openephys_ttl_duration_spin.setValue(500)
-        self.openephys_ttl_duration_spin.setSuffix(" ms")
-        self.openephys_ttl_duration_spin.setToolTip("TTL pulse duration in milliseconds")
-        ttl_layout.addWidget(QLabel("Duration:"))
-        ttl_layout.addWidget(self.openephys_ttl_duration_spin)
-        ttl_layout.addStretch(1)
+        # Serial port and pulse frequency settings
+        teensy_layout = QHBoxLayout()
+        self.teensy_serial_combo = QComboBox()
+        self.teensy_serial_combo.setEditable(True)
+        self.teensy_serial_combo.setPlaceholderText("Select COM port")
+        # Populate with available ports
+        available_ports = list_serial_ports()
+        self.teensy_serial_combo.addItems(available_ports)
+        self.teensy_serial_combo.setToolTip("Serial port for Teensy pulse control")
+        teensy_layout.addWidget(QLabel("Serial:"))
+        teensy_layout.addWidget(self.teensy_serial_combo)
+        
+        self.pulse_frequency_spin = QDoubleSpinBox()
+        self.pulse_frequency_spin.setRange(1.0, 10000.0)
+        self.pulse_frequency_spin.setValue(100.0)
+        self.pulse_frequency_spin.setSuffix(" Hz")
+        self.pulse_frequency_spin.setToolTip("Pulse frequency in Hz")
+        teensy_layout.addWidget(QLabel("Freq:"))
+        teensy_layout.addWidget(self.pulse_frequency_spin)
+        teensy_layout.addStretch(1)
 
         form.addRow(self.openephys_enabled_checkbox)
         form.addRow("OpenEphys", openephys_layout)
-        form.addRow("TTL", ttl_layout)
+        form.addRow("Teensy Pulse", teensy_layout)
 
         # Wrap recording buttons in a widget to prevent shifting
         recording_button_widget = QWidget()
@@ -579,16 +587,23 @@ class MainWindow(QMainWindow):
         self.openephys_enabled_checkbox.setChecked(openephys.enabled)
         self.openephys_host_edit.setText(openephys.host)
         self.openephys_port_spin.setValue(openephys.port)
-        self.openephys_ttl_line_spin.setValue(openephys.ttl_line)
-        self.openephys_ttl_duration_spin.setValue(openephys.ttl_duration)
+        
+        # Set serial port and pulse frequency
+        if openephys.serial_port:
+            index = self.teensy_serial_combo.findText(openephys.serial_port)
+            if index >= 0:
+                self.teensy_serial_combo.setCurrentIndex(index)
+            else:
+                self.teensy_serial_combo.setCurrentText(openephys.serial_port)
+        self.pulse_frequency_spin.setValue(openephys.pulse_frequency)
 
         # Configure OpenEphys controller
         self.openephys_controller.enabled = openephys.enabled
         self.openephys_controller.configure(
             host=openephys.host,
             port=openephys.port,
-            ttl_line=openephys.ttl_line,
-            ttl_duration=openephys.ttl_duration,
+            serial_port=openephys.serial_port,
+            pulse_frequency=openephys.pulse_frequency,
         )
 
         # Set bounding box settings from config
@@ -669,8 +684,8 @@ class MainWindow(QMainWindow):
             enabled=self.openephys_enabled_checkbox.isChecked(),
             host=self.openephys_host_edit.text().strip() or "localhost",
             port=self.openephys_port_spin.value(),
-            ttl_line=self.openephys_ttl_line_spin.value(),
-            ttl_duration=self.openephys_ttl_duration_spin.value(),
+            serial_port=self.teensy_serial_combo.currentText().strip(),
+            pulse_frequency=self.pulse_frequency_spin.value(),
         )
 
     # ------------------------------------------------------------------ actions
@@ -1582,8 +1597,8 @@ class MainWindow(QMainWindow):
         self.openephys_controller.configure(
             host=self.openephys_host_edit.text().strip() or "localhost",
             port=self.openephys_port_spin.value(),
-            ttl_line=self.openephys_ttl_line_spin.value(),
-            ttl_duration=self.openephys_ttl_duration_spin.value(),
+            serial_port=self.teensy_serial_combo.currentText().strip(),
+            pulse_frequency=self.pulse_frequency_spin.value(),
         )
 
     def _on_openephys_error(self, message: str) -> None:
@@ -1834,6 +1849,8 @@ class MainWindow(QMainWindow):
                 recorder.stop()
         self._multi_camera_recorders.clear()
         self.dlc_processor.shutdown()
+        # Close OpenEphys controller serial connection
+        self.openephys_controller.close_serial()
         if hasattr(self, "_metrics_timer"):
             self._metrics_timer.stop()
         super().closeEvent(event)

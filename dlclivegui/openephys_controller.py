@@ -1,9 +1,10 @@
-"""Remote control interface for OpenEphys via HTTP API."""
+"""Remote control interface for OpenEphys via HTTP API and Teensy serial pulse control."""
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -11,29 +12,37 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    logging.warning("pyserial not installed - Teensy pulse control unavailable")
+
 
 @dataclass
 class OpenEphysConfig:
-    """Configuration for OpenEphys remote control."""
+    """Configuration for OpenEphys remote control and Teensy pulse control."""
 
     host: str = "localhost"
     port: int = 37497
-    ttl_line: int = 1
-    ttl_duration: int = 500  # milliseconds
+    serial_port: str = ""  # COM port for Teensy (e.g., "COM3")
+    pulse_frequency: float = 100.0  # Hz
 
 
 class OpenEphysController(QObject):
-    """Controller for remote communication with OpenEphys via HTTP API.
+    """Controller for remote communication with OpenEphys via HTTP API and Teensy pulse control.
 
     This class handles:
     - Starting/stopping OpenEphys recording
-    - Sending TTL pulses via broadcast messages
-    - Sequenced recording start/stop with TTL markers
+    - Sending pulse commands to Teensy via serial
+    - Sequenced recording start/stop with pulse markers
 
     Signals:
         recording_started: Emitted when OpenEphys recording has started
         recording_stopped: Emitted when OpenEphys recording has stopped
-        ttl_sent: Emitted when TTL pulse has been sent
+        ttl_sent: Emitted when pulse has been started
         error: Emitted when an error occurs (str message)
         sequence_complete: Emitted when a start/stop sequence completes
     """
@@ -48,6 +57,7 @@ class OpenEphysController(QObject):
         super().__init__(parent)
         self._config = OpenEphysConfig()
         self._enabled = False
+        self._serial_port: Optional[serial.Serial] = None
 
     @property
     def enabled(self) -> bool:
@@ -67,22 +77,30 @@ class OpenEphysController(QObject):
         self,
         host: str = "localhost",
         port: int = 37497,
-        ttl_line: int = 1,
-        ttl_duration: int = 500,
+        serial_port: str = "",
+        pulse_frequency: float = 100.0,
     ) -> None:
         """Update the controller configuration.
 
         Args:
             host: OpenEphys host address
             port: OpenEphys HTTP server port (default 37497)
-            ttl_line: Digital output line for TTL pulse (1-8)
-            ttl_duration: TTL pulse duration in milliseconds
+            serial_port: COM port for Teensy (e.g., "COM3")
+            pulse_frequency: Pulse frequency in Hz
         """
+        # Close existing serial connection if port changed
+        if self._serial_port is not None and self._config.serial_port != serial_port:
+            try:
+                self._serial_port.close()
+            except Exception:
+                pass
+            self._serial_port = None
+        
         self._config = OpenEphysConfig(
             host=host,
             port=port,
-            ttl_line=ttl_line,
-            ttl_duration=ttl_duration,
+            serial_port=serial_port,
+            pulse_frequency=pulse_frequency,
         )
 
     def _base_url(self) -> str:
@@ -147,43 +165,114 @@ class OpenEphysController(QObject):
             self.error.emit(error_msg)
             return False
 
-    def send_ttl(self) -> bool:
-        """Send TTL pulse command to OpenEphys via broadcast message.
+    def _ensure_serial_connection(self) -> bool:
+        """Ensure serial connection to Teensy is established.
 
-        Uses the ACQBOARD TRIGGER command format.
+        Returns:
+            True if connected, False otherwise.
+        """
+        if not SERIAL_AVAILABLE:
+            self.error.emit("pyserial not installed - cannot control Teensy")
+            return False
+        
+        if not self._config.serial_port:
+            self.error.emit("No serial port configured for Teensy")
+            return False
+        
+        if self._serial_port is not None and self._serial_port.is_open:
+            return True
+        
+        try:
+            self._serial_port = serial.Serial(
+                self._config.serial_port,
+                baudrate=115200,
+                timeout=2.0
+            )
+            # Wait for Teensy to initialize
+            time.sleep(0.5)
+            # Read any startup messages
+            while self._serial_port.in_waiting:
+                line = self._serial_port.readline().decode('utf-8', errors='ignore').strip()
+                logging.info(f"Teensy: {line}")
+            return True
+        except Exception as e:
+            error_msg = f"Failed to connect to Teensy on {self._config.serial_port}: {e}"
+            logging.error(error_msg)
+            self.error.emit(error_msg)
+            return False
+
+    def send_ttl(self) -> bool:
+        """Send START command to Teensy to begin pulse generation.
 
         Returns:
             True if successful, False otherwise.
         """
-        ttl_line = self._config.ttl_line
-        ttl_duration = self._config.ttl_duration
-
-        url = f"{self._base_url()}/message"
-        # ACQBOARD TRIGGER command format: ACQBOARD TRIGGER <line> <duration_ms>
-        message = f"ACQBOARD TRIGGER {ttl_line} {ttl_duration}"
-        data = json.dumps({"text": message}).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="PUT")
-        req.add_header("Content-Type", "application/json")
-
+        if not self._ensure_serial_connection():
+            return False
+        
         try:
-            with urllib.request.urlopen(req, timeout=5) as response:
-                logging.info(
-                    f"OpenEphys TTL sent (line {ttl_line}, {ttl_duration}ms): {response.status}"
-                )
-                if response.status == 200:
-                    self.ttl_sent.emit()
-                    return True
+            frequency = self._config.pulse_frequency
+            command = f"START {frequency}\n"
+            self._serial_port.write(command.encode('utf-8'))
+            
+            # Wait for response
+            response = self._serial_port.readline().decode('utf-8', errors='ignore').strip()
+            logging.info(f"Teensy response: {response}")
+            
+            if response.startswith("OK START"):
+                self.ttl_sent.emit()
+                return True
+            else:
+                error_msg = f"Teensy error: {response}"
+                logging.error(error_msg)
+                self.error.emit(error_msg)
                 return False
-        except urllib.error.URLError as e:
-            error_msg = f"Failed to send OpenEphys TTL: {e}"
-            logging.error(error_msg)
-            self.error.emit(error_msg)
-            return False
         except Exception as e:
-            error_msg = f"OpenEphys communication error: {e}"
+            error_msg = f"Failed to send pulse command to Teensy: {e}"
             logging.error(error_msg)
             self.error.emit(error_msg)
             return False
+
+    def stop_pulse(self) -> bool:
+        """Send STOP command to Teensy to stop pulse generation.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not self._ensure_serial_connection():
+            return False
+        
+        try:
+            command = "STOP\n"
+            self._serial_port.write(command.encode('utf-8'))
+            
+            # Wait for response
+            response = self._serial_port.readline().decode('utf-8', errors='ignore').strip()
+            logging.info(f"Teensy response: {response}")
+            
+            if response.startswith("OK STOP"):
+                return True
+            else:
+                error_msg = f"Teensy error: {response}"
+                logging.error(error_msg)
+                self.error.emit(error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"Failed to stop Teensy pulse: {e}"
+            logging.error(error_msg)
+            self.error.emit(error_msg)
+            return False
+    
+    def close_serial(self) -> None:
+        """Close serial connection to Teensy."""
+        if self._serial_port is not None:
+            try:
+                # Stop pulse before closing
+                self.stop_pulse()
+                self._serial_port.close()
+            except Exception:
+                pass
+            self._serial_port = None
 
     def get_status(self) -> Optional[str]:
         """Query the current status of OpenEphys.
@@ -260,7 +349,7 @@ class OpenEphysRecordingSequencer(QObject):
 
     @property
     def ttl_delay_ms(self) -> int:
-        """Delay between video recording and TTL pulse in milliseconds."""
+        """Delay in milliseconds between video start/stop and pulse."""
         return self._ttl_delay_ms
 
     @ttl_delay_ms.setter
@@ -334,11 +423,27 @@ class OpenEphysRecordingSequencer(QObject):
 
     def _complete_stop_sequence(self) -> None:
         """Complete the stop sequence after TTL delay."""
-        # Step 2: Stop video recording
+        # Step 2: Stop pulse
+        self._controller.stop_pulse()
+        
+        # Step 3: Stop video recording
         self.stop_video_recording.emit()
 
-        # Step 3: Stop OpenEphys recording
+        # Step 4: Stop OpenEphys recording
         self._controller.stop_recording()
 
         self._sequence_in_progress = False
         self.sequence_complete.emit("stop")
+
+
+def list_serial_ports() -> list[str]:
+    """List available serial ports.
+
+    Returns:
+        List of available COM port names.
+    """
+    if not SERIAL_AVAILABLE:
+        return []
+    
+    ports = serial.tools.list_ports.comports()
+    return [port.device for port in ports]

@@ -740,13 +740,6 @@ class GenTLCameraBackend(CameraBackend):
     def _set_trigger_off(self, node_map) -> None:
         """Disable trigger mode (freerun/continuous acquisition)."""
         try:
-            # First try to set TriggerSelector if available
-            if hasattr(node_map, "TriggerSelector"):
-                try:
-                    node_map.TriggerSelector.value = self._trigger_selector
-                except Exception as e:
-                    LOG.debug(f"Could not set TriggerSelector: {e}")
-
             # Disable trigger mode
             if hasattr(node_map, "TriggerMode"):
                 try:
@@ -762,52 +755,7 @@ class GenTLCameraBackend(CameraBackend):
 
     def _set_trigger_on(self, node_map) -> None:
         """Enable external trigger mode with configured settings."""
-        try:
-            # Step 1: Set TriggerSelector (which event to trigger)
-            if hasattr(node_map, "TriggerSelector"):
-                available_selectors = []
-                try:
-                    available_selectors = list(node_map.TriggerSelector.symbolics)
-                except Exception:
-                    pass
-
-                if self._trigger_selector in available_selectors:
-                    node_map.TriggerSelector.value = self._trigger_selector
-                    LOG.info(f"TriggerSelector set to '{self._trigger_selector}'")
-                elif available_selectors:
-                    # Use first available if requested not available
-                    node_map.TriggerSelector.value = available_selectors[0]
-                    LOG.warning(
-                        f"TriggerSelector '{self._trigger_selector}' not available, "
-                        f"using '{available_selectors[0]}'. Available: {available_selectors}"
-                    )
-
-            # Step 2: Set TriggerSource (where trigger signal comes from)
-            if hasattr(node_map, "TriggerSource"):
-                available_sources = []
-                try:
-                    available_sources = list(node_map.TriggerSource.symbolics)
-                except Exception:
-                    pass
-
-                if self._trigger_source in available_sources:
-                    node_map.TriggerSource.value = self._trigger_source
-                    LOG.info(f"TriggerSource set to '{self._trigger_source}'")
-                elif available_sources:
-                    # Try common hardware trigger sources
-                    for fallback in ["Line0", "Line1", "Line2", "CC1"]:
-                        if fallback in available_sources:
-                            node_map.TriggerSource.value = fallback
-                            LOG.warning(
-                                f"TriggerSource '{self._trigger_source}' not available, "
-                                f"using '{fallback}'. Available: {available_sources}"
-                            )
-                            break
-                    else:
-                        LOG.warning(
-                            f"Could not set TriggerSource. Available: {available_sources}"
-                        )
-
+        try:    
             # Step 3: Set TriggerActivation (edge type)
             if hasattr(node_map, "TriggerActivation"):
                 available_activations = []

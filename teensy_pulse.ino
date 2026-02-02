@@ -1,66 +1,102 @@
 /*
- * Teensy TTL Triggered 100Hz Pulse Gen
- * * Logic:
- * 1. Listens for a RISING edge on Pin 2 (TTL Trigger).
- * 2. Immediately toggles the output state (On/Off).
- * 3. If On: Starts a 100Hz square wave on Pin 3.
- * 4. If Off: Stops the wave and forces Pin 3 LOW.
+ * Teensy Serial-Controlled Pulse Generator
+ * 
+ * Serial Commands:
+ * - START <frequency>  : Start pulse at specified frequency (e.g., "START 100")
+ * - STOP               : Stop pulse generation
+ * 
+ * Response:
+ * - OK START <frequency>
+ * - OK STOP
+ * - ERROR <message>
  */
 
 // --- Configuration ---
-const int TRIGGER_PIN = 2; // Input from TTL
 const int OUTPUT_PIN = 3;  // Output Pulse
-const float FREQUENCY_HZ = 100.0;
 
 // --- Variables ---
 IntervalTimer myTimer;
 volatile int outputState = LOW;
 volatile bool isRunning = false;
-volatile unsigned long lastTriggerTime = 0;
+float currentFrequency = 0.0;
 
-// --- Timer ISR (Handles the 100Hz Wave) ---
+// --- Timer ISR (Handles the Pulse Wave) ---
 void timerCallback() {
   outputState = !outputState;
   digitalWriteFast(OUTPUT_PIN, outputState);
 }
 
-// --- Trigger ISR (Handles the Input) ---
-void onTriggerReceived() {
-  // Optional: Simple glitch filter (ignore triggers closer than 50ms)
-  // If your TTL source is very clean, you can remove this 'if'.
-  if (micros() - lastTriggerTime < 50000) return; 
-  lastTriggerTime = micros();
-
-  isRunning = !isRunning;
-
-  if (isRunning) {
-    // START 
-    // 1. Set line High immediately to align phase with trigger
+// --- Command Processing ---
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  
+  if (command.startsWith("START")) {
+    // Parse frequency from command
+    int spaceIndex = command.indexOf(' ');
+    if (spaceIndex == -1) {
+      Serial.println("ERROR Missing frequency parameter");
+      return;
+    }
+    
+    String freqStr = command.substring(spaceIndex + 1);
+    float frequency = freqStr.toFloat();
+    
+    if (frequency <= 0.0 || frequency > 10000.0) {
+      Serial.println("ERROR Invalid frequency (must be 0-10000 Hz)");
+      return;
+    }
+    
+    // Stop existing pulse if running
+    if (isRunning) {
+      myTimer.end();
+    }
+    
+    currentFrequency = frequency;
+    isRunning = true;
+    
+    // Set line High immediately to align phase
     outputState = HIGH;
     digitalWriteFast(OUTPUT_PIN, HIGH);
     
-    // 2. Start timer for the next toggle (5ms later)
-    // 100Hz = 10ms period -> toggle every 5ms
-    float microsecInterval = (1000000.0 / FREQUENCY_HZ) / 2.0;
+    // Start timer for the next toggle
+    // frequency Hz -> period = 1/freq seconds -> toggle every period/2
+    float microsecInterval = (1000000.0 / frequency) / 2.0;
     myTimer.begin(timerCallback, microsecInterval);
     
+    Serial.print("OK START ");
+    Serial.println(frequency);
+    
+  } else if (command.equals("STOP")) {
+    if (isRunning) {
+      myTimer.end();
+      isRunning = false;
+      currentFrequency = 0.0;
+      digitalWriteFast(OUTPUT_PIN, LOW); // Force Low
+      Serial.println("OK STOP");
+    } else {
+      Serial.println("OK STOP (already stopped)");
+    }
+    
   } else {
-    // STOP
-    myTimer.end();
-    digitalWriteFast(OUTPUT_PIN, LOW); // Force Low
+    Serial.print("ERROR Unknown command: ");
+    Serial.println(command);
   }
 }
 
 void setup() {
+  Serial.begin(115200);
   pinMode(OUTPUT_PIN, OUTPUT);
+  digitalWrite(OUTPUT_PIN, LOW);
   
-  // Triggers usually drive the line High/Low, so standard INPUT is fine.
-  // We trigger on RISING edge (0V -> 5V transition).
-  pinMode(TRIGGER_PIN, INPUT); 
-  attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), onTriggerReceived, RISING);
+  // Send ready message
+  Serial.println("READY Teensy Pulse Generator");
 }
 
 void loop() {
-  // Main loop is empty; everything is handled by hardware interrupts
-  // for maximum precision.
+  // Process serial commands
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    processCommand(command);
+  }
 }
