@@ -755,7 +755,55 @@ class GenTLCameraBackend(CameraBackend):
 
     def _set_trigger_on(self, node_map) -> None:
         """Enable external trigger mode with configured settings."""
-        try:    
+        try:
+            # Step 1: Set TriggerSelector (which event to trigger)
+            if hasattr(node_map, "TriggerSelector"):
+                available_selectors = []
+                try:
+                    available_selectors = list(node_map.TriggerSelector.symbolics)
+                except Exception:
+                    pass
+
+                if self._trigger_selector in available_selectors:
+                    node_map.TriggerSelector.value = self._trigger_selector
+                    LOG.info(f"TriggerSelector set to '{self._trigger_selector}'")
+                elif available_selectors:
+                    # Default to FrameStart if available
+                    if "FrameStart" in available_selectors:
+                        node_map.TriggerSelector.value = "FrameStart"
+                        LOG.warning(
+                            f"TriggerSelector '{self._trigger_selector}' not available, "
+                            f"using 'FrameStart'. Available: {available_selectors}"
+                        )
+                    else:
+                        LOG.warning(
+                            f"Could not set TriggerSelector. Available: {available_selectors}"
+                        )
+
+            # Step 2: Set TriggerSource (input line for trigger)
+            if hasattr(node_map, "TriggerSource"):
+                available_sources = []
+                try:
+                    available_sources = list(node_map.TriggerSource.symbolics)
+                except Exception:
+                    pass
+
+                if self._trigger_source in available_sources:
+                    node_map.TriggerSource.value = self._trigger_source
+                    LOG.info(f"TriggerSource set to '{self._trigger_source}'")
+                elif available_sources:
+                    # Try to use Line0 as default if available
+                    if "Line0" in available_sources:
+                        node_map.TriggerSource.value = "Line0"
+                        LOG.warning(
+                            f"TriggerSource '{self._trigger_source}' not available, "
+                            f"using 'Line0'. Available: {available_sources}"
+                        )
+                    else:
+                        LOG.warning(
+                            f"Could not set TriggerSource. Available: {available_sources}"
+                        )
+    
             # Step 3: Set TriggerActivation (edge type)
             if hasattr(node_map, "TriggerActivation"):
                 available_activations = []

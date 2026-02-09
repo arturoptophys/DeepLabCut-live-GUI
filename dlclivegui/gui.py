@@ -587,7 +587,6 @@ class MainWindow(QMainWindow):
                 self.teensy_serial_combo.setCurrentIndex(index)
             else:
                 self.teensy_serial_combo.setCurrentText(openephys.serial_port)
-        self.pulse_frequency_spin.setValue(openephys.pulse_frequency)
 
         # Configure OpenEphys controller
         self.openephys_controller.enabled = openephys.enabled
@@ -675,14 +674,8 @@ class MainWindow(QMainWindow):
         # Get pulse frequency from active camera FPS
         pulse_frequency = 100.0  # Default fallback
         if self._config.multi_camera.cameras:
-            # Use DLC camera if specified, otherwise first camera
-            if self._config.multi_camera.dlc_camera_id:
-                for cam in self._config.multi_camera.cameras:
-                    if get_camera_id(cam) == self._config.multi_camera.dlc_camera_id:
-                        pulse_frequency = int(cam.fps)
-                        break
-            else:
-                pulse_frequency = int(self._config.multi_camera.cameras[0].fps)
+            # Use first camera
+            pulse_frequency = int(self._config.multi_camera.cameras[0].fps)
         
         return OpenEphysSettings(
             enabled=self.openephys_enabled_checkbox.isChecked(),
@@ -1085,6 +1078,32 @@ class MainWindow(QMainWindow):
         if not active_cams:
             self._show_error("No cameras configured. Use 'Configure Cameras...' to add cameras.")
             return
+
+        # If hardware triggering is enabled, synchronize camera settings
+        if self.openephys_enabled_checkbox.isChecked():
+            reference_fps = active_cams[0].fps
+            
+            # Synchronize all cameras to same framerate
+            for cam in active_cams:
+                cam.fps = reference_fps
+                
+                # Enable hardware triggering only for backends that support it
+                # (gentl and basler support hardware triggering, opencv does not)
+                if cam.backend in ("gentl", "basler"):
+                    if not cam.properties:
+                        cam.properties = {}
+                    cam.properties["trigger_mode"] = "triggered"
+                    cam.properties["trigger_source"] = "Line0"
+                    cam.properties["trigger_activation"] = "RisingEdge"
+                    cam.properties["trigger_selector"] = "FrameStart"
+                    logging.info(f"Hardware triggering enabled for camera {cam.name} ({cam.backend})")
+                else:
+                    logging.warning(
+                        f"Hardware triggering not supported for camera {cam.name} ({cam.backend}), "
+                        f"camera will run in freerun mode"
+                    )
+            
+            logging.info(f"Hardware triggering enabled: all cameras synchronized to {reference_fps:.2f} FPS")
 
         # Determine if we're in single or multi-camera mode
         self._multi_camera_mode = len(active_cams) > 1
@@ -1568,6 +1587,15 @@ class MainWindow(QMainWindow):
         self._sync_openephys_controller_from_ui()
 
         if self.openephys_enabled_checkbox.isChecked():
+            # Validate serial port is selected
+            serial_port = self.teensy_serial_combo.currentText().strip()
+            if not serial_port:
+                self._show_error(
+                    "Serial port is required for hardware triggering.\n"
+                    "Please select a serial port for Teensy control."
+                )
+                return
+            
             self.statusBar().showMessage("Starting OpenEphys synchronized recording...", 3000)
             # Use sequencer for coordinated start
             if not self.openephys_sequencer.start_recording_sequence():
@@ -1585,15 +1613,30 @@ class MainWindow(QMainWindow):
         1. Send TTL pulse to mark recording end
         2. After 1 second, stop video recording
         3. Stop OpenEphys recording
+        4. After a delay, stop preview to capture remaining frames
         """
         if self.openephys_enabled_checkbox.isChecked():
             self.statusBar().showMessage("Stopping OpenEphys synchronized recording...", 3000)
             # Use sequencer for coordinated stop
             self.openephys_sequencer.stop_recording_sequence()
             # Video recording will be stopped by sequencer signal
+            
+            # Schedule preview stop after a delay to capture remaining frames
+            # Wait 2 seconds after recording stops to ensure all frames are captured
+            QTimer.singleShot(2000, self._delayed_preview_stop_after_hardware_recording)
         else:
             # No OpenEphys control, stop immediately
             self._stop_multi_camera_recording()
+
+    def _delayed_preview_stop_after_hardware_recording(self) -> None:
+        """Stop preview after hardware-triggered recording has completed.
+        
+        This is called with a delay after recording stops to ensure all
+        frames triggered by the Teensy have been captured.
+        """
+        if self.multi_camera_controller.is_running() and not self._multi_camera_recorders:
+            logging.info("Stopping preview after hardware-triggered recording completed")
+            self._stop_preview()
 
     def _sync_openephys_controller_from_ui(self) -> None:
         """Sync OpenEphys controller configuration from UI values."""
