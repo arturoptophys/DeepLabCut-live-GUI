@@ -24,7 +24,8 @@ class MultiFrameData:
     """Container for frames from multiple cameras."""
 
     frames: Dict[str, np.ndarray]  # camera_id -> frame
-    timestamps: Dict[str, float]  # camera_id -> timestamp
+    timestamps: Dict[str, float]  # camera_id -> hardware timestamp
+    perf_counters: Dict[str, float]  # camera_id -> time.perf_counter() at frame receipt
     source_camera_id: str = ""  # ID of camera that triggered this emission
     tiled_frame: Optional[np.ndarray] = None  # Combined tiled frame (deprecated, done in GUI)
 
@@ -32,7 +33,7 @@ class MultiFrameData:
 class SingleCameraWorker(QObject):
     """Worker for a single camera in multi-camera mode."""
 
-    frame_captured = Signal(str, object, float)  # camera_id, frame, timestamp
+    frame_captured = Signal(str, object, float, float)  # camera_id, frame, hw_timestamp, perf_counter
     error_occurred = Signal(str, str)  # camera_id, error_message
     started = Signal(str)  # camera_id
     stopped = Signal(str)  # camera_id
@@ -81,7 +82,8 @@ class SingleCameraWorker(QObject):
                     continue
 
                 consecutive_errors = 0
-                self.frame_captured.emit(self._camera_id, frame, timestamp)
+                pc = time.perf_counter()
+                self.frame_captured.emit(self._camera_id, frame, timestamp, pc)
 
             except Exception as exc:
                 consecutive_errors += 1
@@ -131,6 +133,7 @@ class MultiCameraController(QObject):
         self._settings: Dict[str, CameraSettings] = {}
         self._frames: Dict[str, np.ndarray] = {}
         self._timestamps: Dict[str, float] = {}
+        self._perf_counters: Dict[str, float] = {}
         self._frame_lock = Lock()
         self._running = False
         self._started_cameras: set = set()
@@ -167,6 +170,7 @@ class MultiCameraController(QObject):
         self._running = True
         self._frames.clear()
         self._timestamps.clear()
+        self._perf_counters.clear()
         self._started_cameras.clear()
         self._failed_cameras.clear()
         self._expected_cameras = len(active_settings)
@@ -220,10 +224,11 @@ class MultiCameraController(QObject):
         self._settings.clear()
         self._started_cameras.clear()
         self._failed_cameras.clear()
+        self._perf_counters.clear()
         self._expected_cameras = 0
         self.all_stopped.emit()
 
-    def _on_frame_captured(self, camera_id: str, frame: np.ndarray, timestamp: float) -> None:
+    def _on_frame_captured(self, camera_id: str, frame: np.ndarray, timestamp: float, perf_counter: float) -> None:
         """Handle a frame from one camera."""
         # Apply rotation if configured
         settings = self._settings.get(camera_id)
@@ -239,12 +244,14 @@ class MultiCameraController(QObject):
         with self._frame_lock:
             self._frames[camera_id] = frame
             self._timestamps[camera_id] = timestamp
+            self._perf_counters[camera_id] = perf_counter
 
             # Emit frame data without tiling (tiling done in GUI for performance)
             if self._frames:
                 frame_data = MultiFrameData(
                     frames=dict(self._frames),
                     timestamps=dict(self._timestamps),
+                    perf_counters=dict(self._perf_counters),
                     source_camera_id=camera_id,  # Track which camera triggered this
                     tiled_frame=None,
                 )
@@ -407,6 +414,7 @@ class MultiCameraController(QObject):
         with self._frame_lock:
             self._frames.pop(camera_id, None)
             self._timestamps.pop(camera_id, None)
+            self._perf_counters.pop(camera_id, None)
 
         # Check if all cameras have reported and none started
         total_reported = len(self._started_cameras) + len(self._failed_cameras)

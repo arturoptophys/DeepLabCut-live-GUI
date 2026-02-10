@@ -901,9 +901,10 @@ class MainWindow(QMainWindow):
                 recorder = self._multi_camera_recorders[cam_id]
                 if recorder.is_running:
                     frame = frame_data.frames[cam_id]
-                    timestamp = frame_data.timestamps.get(cam_id, time.time())
+                    hw_timestamp = frame_data.timestamps.get(cam_id, time.time())
+                    pc = frame_data.perf_counters.get(cam_id)
                     try:
-                        recorder.write(frame, timestamp=timestamp)
+                        recorder.write(frame, timestamp=hw_timestamp, perf_counter=pc)
                     except Exception as exc:
                         logging.warning(f"Failed to write frame for camera {cam_id}: {exc}")
 

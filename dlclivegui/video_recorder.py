@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,7 +72,10 @@ class VideoRecorder:
         self._written_times: deque[float] = deque(maxlen=600)
         self._encode_error: Optional[Exception] = None
         self._last_log_time = 0.0
-        self._frame_timestamps: List[float] = []
+        # Enhanced timestamp storage: (hw_timestamp, perf_counter, wall_clock) per frame
+        self._frame_timestamps: List[Tuple[float, float, float]] = []
+        self._first_frame_wall_clock: Optional[str] = None  # ISO-8601 wall clock of first frame
+        self._first_frame_perf_counter: Optional[float] = None
 
     @property
     def is_running(self) -> bool:
@@ -105,6 +109,8 @@ class VideoRecorder:
         self._last_latency = 0.0
         self._written_times.clear()
         self._frame_timestamps.clear()
+        self._first_frame_wall_clock = None
+        self._first_frame_perf_counter = None
         self._encode_error = None
         self._stop_event.clear()
         self._writer_thread = threading.Thread(
@@ -118,16 +124,31 @@ class VideoRecorder:
         self._frame_size = frame_size
         self._frame_rate = frame_rate
 
-    def write(self, frame: np.ndarray, timestamp: Optional[float] = None) -> bool:
+    def write(self, frame: np.ndarray, timestamp: Optional[float] = None,
+              perf_counter: Optional[float] = None) -> bool:
+        """Write a frame to the video file.
+
+        Parameters
+        ----------
+        frame : np.ndarray
+            The video frame.
+        timestamp : float, optional
+            Hardware/camera timestamp for this frame.
+        perf_counter : float, optional
+            ``time.perf_counter()`` value captured when the frame was
+            received from the camera.  Used together with *timestamp* to
+            detect dropped frames after the fact.
+        """
         if not self.is_running or self._queue is None:
             return False
         error = self._current_error()
         if error is not None:
             raise RuntimeError(f"Video encoding failed: {error}") from error
 
-        # Capture timestamp now, but only record it if frame is successfully enqueued
-        if timestamp is None:
-            timestamp = time.time()
+        # Capture timing info for this frame
+        now_pc = perf_counter if perf_counter is not None else time.perf_counter()
+        now_wall = time.time()
+        hw_ts = timestamp if timestamp is not None else now_wall
 
         # Convert frame to uint8 if needed
         if frame.dtype != np.uint8:
@@ -177,7 +198,11 @@ class VideoRecorder:
             return False
         with self._stats_lock:
             self._frames_enqueued += 1
-            self._frame_timestamps.append(timestamp)
+            # Record first-frame wall clock (ISO-8601) once
+            if self._first_frame_wall_clock is None:
+                self._first_frame_wall_clock = datetime.now(timezone.utc).isoformat()
+                self._first_frame_perf_counter = now_pc
+            self._frame_timestamps.append((hw_ts, now_pc, now_wall))
         return True
 
     def stop(self) -> None:
@@ -304,7 +329,17 @@ class VideoRecorder:
             return self._encode_error
 
     def _save_timestamps(self) -> None:
-        """Save frame timestamps to a JSON file alongside the video."""
+        """Save frame timestamps to a JSON file alongside the video.
+
+        Each frame stores three time values to enable multi-camera and
+        external-source synchronisation:
+        - **hw_timestamp**: Camera/hardware timestamp (from GenTL buffer)
+        - **perf_counter**: ``time.perf_counter()`` value at frame receipt
+        - **wall_clock**: ``time.time()`` (Unix epoch seconds) at frame receipt
+
+        Additionally the wall-clock time of the very first frame is stored
+        in ISO-8601 format for quick human-readable reference.
+        """
         if not self._frame_timestamps:
             logger.info("No timestamps to save")
             return
@@ -317,15 +352,37 @@ class VideoRecorder:
         try:
             with self._stats_lock:
                 timestamps = self._frame_timestamps.copy()
+                first_wall_clock = self._first_frame_wall_clock
+                first_perf_counter = self._first_frame_perf_counter
+
+            hw_timestamps = [t[0] for t in timestamps]
+            perf_counters = [t[1] for t in timestamps]
+            wall_clocks = [t[2] for t in timestamps]
+
+            # Compute inter-frame intervals from perf_counter for drop detection
+            perf_intervals = []
+            for i in range(1, len(perf_counters)):
+                perf_intervals.append(perf_counters[i] - perf_counters[i - 1])
 
             # Prepare metadata
             data = {
                 "video_file": str(self._output.name),
                 "num_frames": len(timestamps),
-                "timestamps": timestamps,
-                "start_time": timestamps[0] if timestamps else None,
-                "end_time": timestamps[-1] if timestamps else None,
-                "duration_seconds": timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0,
+                "first_frame_wall_clock_iso": first_wall_clock,
+                "first_frame_perf_counter": first_perf_counter,
+                "start_wall_clock": wall_clocks[0] if wall_clocks else None,
+                "end_wall_clock": wall_clocks[-1] if wall_clocks else None,
+                "duration_seconds": (
+                    perf_counters[-1] - perf_counters[0]
+                    if len(perf_counters) > 1
+                    else 0.0
+                ),
+                "frames": {
+                    "hw_timestamp": hw_timestamps,
+                    "perf_counter": perf_counters,
+                    "wall_clock": wall_clocks,
+                },
+                "perf_counter_intervals": perf_intervals,
             }
 
             # Write to JSON
