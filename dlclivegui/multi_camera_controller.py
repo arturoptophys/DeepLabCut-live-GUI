@@ -65,7 +65,14 @@ class SingleCameraWorker(QObject):
         while not self._stop_event.is_set():
             try:
                 frame, timestamp = self._backend.read()
-                if frame is None or frame.size == 0:
+                if frame is None:
+                    # None frame = timeout waiting for data (normal in trigger mode)
+                    # Don't count as error, just continue waiting
+                    consecutive_errors = 0  # Reset error count
+                    continue
+                    
+                if frame.size == 0:
+                    # Empty frame = actual problem
                     consecutive_errors += 1
                     if consecutive_errors >= self._max_consecutive_errors:
                         self.error_occurred.emit(self._camera_id, "Too many empty frames")

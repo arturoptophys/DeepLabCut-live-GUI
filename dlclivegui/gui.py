@@ -1644,7 +1644,7 @@ class MainWindow(QMainWindow):
         pulse_frequency = 100.0  # Default fallback
         if self._config.multi_camera.cameras:
             # Use DLC camera if specified, otherwise first camera
-            if self._config.multi_camera.dlc_camera_id:
+            if hasattr(self._config.multi_camera, "dlc_camera_id"):
                 for cam in self._config.multi_camera.cameras:
                     if get_camera_id(cam) == self._config.multi_camera.dlc_camera_id:
                         pulse_frequency = float(cam.fps)

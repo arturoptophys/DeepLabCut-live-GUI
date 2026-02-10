@@ -183,6 +183,10 @@ class GenTLCameraBackend(CameraBackend):
         self._trigger_activation: str = props.get("trigger_activation", "RisingEdge")
         # trigger_selector: "FrameStart", "ExposureStart", "ExposureActive" (default: "FrameStart")
         self._trigger_selector: str = props.get("trigger_selector", "FrameStart")
+        
+        # Frame counting for trigger mode debugging
+        self._frame_count: int = 0
+        self._last_buffer_stats_log: float = 0.0
 
         self._shared_harvester: Optional[_SharedHarvester] = None
         self._harvester: Optional[Harvester] = None  # Reference to shared harvester
@@ -244,6 +248,21 @@ class GenTLCameraBackend(CameraBackend):
                 )
 
         self._acquirer = self._create_acquirer(serial, index)
+        
+        # Configure buffer count for trigger mode to prevent drops
+        # More buffers = more tolerance for processing delays
+        if self._trigger_mode in ("triggered", "trigger", "on", "external", "hardware"):
+            try:
+                # Allocate more buffers for triggered acquisition (default is often 3-5)
+                num_buffers = int(self.settings.properties.get("num_buffers", 10))
+                if hasattr(self._acquirer, 'num_buffers'):
+                    self._acquirer.num_buffers = num_buffers
+                    LOG.info(f"Set buffer count to {num_buffers} for trigger mode")
+                elif hasattr(self._acquirer, 'num_filled_buffers_to_hold'):
+                    self._acquirer.num_filled_buffers_to_hold = num_buffers
+                    LOG.info(f"Set filled buffer count to {num_buffers} for trigger mode")
+            except Exception as e:
+                LOG.warning(f"Could not configure buffer count: {e}")
 
         remote = self._acquirer.remote_device
         node_map = remote.node_map
@@ -289,8 +308,13 @@ class GenTLCameraBackend(CameraBackend):
         if self._acquirer is None:
             raise RuntimeError("GenTL image acquirer not initialised")
 
+        # Use longer timeout for trigger mode to avoid missing frames
+        timeout = self._timeout
+        if self._trigger_mode in ("triggered", "trigger", "on", "external", "hardware"):
+            timeout = max(self._timeout, 5.0)  # At least 5 seconds for trigger mode
+
         try:
-            with self._acquirer.fetch(timeout=self._timeout) as buffer:
+            with self._acquirer.fetch(timeout=timeout) as buffer:
                 component = buffer.payload.components[0]
                 channels = 3 if self._pixel_format in {"RGB8", "BGR8"} else 1
                 array = np.asarray(component.data)
@@ -304,11 +328,44 @@ class GenTLCameraBackend(CameraBackend):
                         frame = array.reshape(component.height, component.width).copy()
                 except ValueError:
                     frame = array.copy()
+                
+                # Extract hardware timestamp from buffer if available
+                # This is the actual camera timestamp, not the fetch time
+                try:
+                    # Harvesters buffer has timestamp_ns (nanoseconds since epoch)
+                    if hasattr(buffer, 'timestamp_ns') and buffer.timestamp_ns is not None:
+                        timestamp = buffer.timestamp_ns / 1e9  # Convert to seconds
+                    elif hasattr(buffer, 'timestamp') and buffer.timestamp is not None:
+                        timestamp = float(buffer.timestamp)
+                    else:
+                        # Fallback to system time
+                        timestamp = time.time()
+                except Exception:
+                    timestamp = time.time()
+                
+                # Track frame count and log buffer statistics periodically
+                self._frame_count += 1
+                current_time = time.time()
+                if current_time - self._last_buffer_stats_log > 5.0:
+                    try:
+                        # Log buffer statistics to help debug frame drops
+                        num_buffers = len(self._acquirer._announced_buffers) if hasattr(self._acquirer, '_announced_buffers') else 'unknown'
+                        LOG.debug(f"{self._device_label or 'Camera'}: Frame {self._frame_count}, Buffers: {num_buffers}")
+                    except Exception:
+                        pass
+                    self._last_buffer_stats_log = current_time
+                    
         except HarvesterTimeoutError as exc:
-            raise TimeoutError(str(exc) + " (GenTL timeout)") from exc
+            # In trigger mode, timeouts are expected when waiting for triggers
+            # Return None to allow caller to retry without sleep delay
+            if self._trigger_mode in ("triggered", "trigger", "on", "external", "hardware"):
+                LOG.debug(f"{self._device_label or 'Camera'}: Waiting for trigger (timeout)")
+                return None, 0.0
+            else:
+                # In freerun mode, timeout is an actual error
+                raise TimeoutError(str(exc) + " (GenTL timeout)") from exc
 
         frame = self._convert_frame(frame)
-        timestamp = time.time()
         return frame, timestamp
 
     def set_trigger_mode(self, mode: str) -> None:
@@ -780,29 +837,29 @@ class GenTLCameraBackend(CameraBackend):
                             f"Could not set TriggerSelector. Available: {available_selectors}"
                         )
 
-            # Step 2: Set TriggerSource (input line for trigger)
-            if hasattr(node_map, "TriggerSource"):
-                available_sources = []
-                try:
-                    available_sources = list(node_map.TriggerSource.symbolics)
-                except Exception:
-                    pass
+            # # Step 2: Set TriggerSource (input line for trigger)
+            # if hasattr(node_map, "TriggerSource"):
+            #     available_sources = []
+            #     try:
+            #         available_sources = list(node_map.TriggerSource.symbolics)
+            #     except Exception:
+            #         pass
 
-                if self._trigger_source in available_sources:
-                    node_map.TriggerSource.value = self._trigger_source
-                    LOG.info(f"TriggerSource set to '{self._trigger_source}'")
-                elif available_sources:
-                    # Try to use Line0 as default if available
-                    if "Line0" in available_sources:
-                        node_map.TriggerSource.value = "Line0"
-                        LOG.warning(
-                            f"TriggerSource '{self._trigger_source}' not available, "
-                            f"using 'Line0'. Available: {available_sources}"
-                        )
-                    else:
-                        LOG.warning(
-                            f"Could not set TriggerSource. Available: {available_sources}"
-                        )
+            #     if self._trigger_source in available_sources:
+            #         node_map.TriggerSource.value = self._trigger_source
+            #         LOG.info(f"TriggerSource set to '{self._trigger_source}'")
+            #     elif available_sources:
+            #         # Try to use Line1 as default if available
+            #         if "Line1" in available_sources:
+            #             node_map.TriggerSource.value = "Line1"
+            #             LOG.warning(
+            #                 f"TriggerSource '{self._trigger_source}' not available, "
+            #                 f"using 'Line1'. Available: {available_sources}"
+            #             )
+            #         else:
+            #             LOG.warning(
+            #                 f"Could not set TriggerSource. Available: {available_sources}"
+            #             )
     
             # Step 3: Set TriggerActivation (edge type)
             if hasattr(node_map, "TriggerActivation"):
