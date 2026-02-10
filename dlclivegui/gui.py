@@ -444,9 +444,24 @@ class MainWindow(QMainWindow):
         # Populate with available ports
         available_ports = list_serial_ports()
         self.teensy_serial_combo.addItems(available_ports)
-        self.teensy_serial_combo.setToolTip("Serial port for Teensy pulse control (frequency matches camera FPS)")
+        self.teensy_serial_combo.setToolTip("Serial port for Teensy pulse control")
         teensy_layout.addWidget(QLabel("Serial:"))
         teensy_layout.addWidget(self.teensy_serial_combo)
+
+        # Trigger FPS: the desired trigger frame rate sent to Teensy.
+        # Camera internal frame rate will be set higher to avoid rate limiting.
+        self.trigger_fps_spin = QDoubleSpinBox()
+        self.trigger_fps_spin.setRange(1.0, 500.0)
+        self.trigger_fps_spin.setDecimals(1)
+        self.trigger_fps_spin.setValue(100.0)
+        self.trigger_fps_spin.setSuffix(" Hz")
+        self.trigger_fps_spin.setToolTip(
+            "Trigger pulse frequency (Hz). Camera frame rate will be set\n"
+            "above this value to prevent the internal rate limiter from\n"
+            "dropping triggered frames."
+        )
+        teensy_layout.addWidget(QLabel("Trigger FPS:"))
+        teensy_layout.addWidget(self.trigger_fps_spin)
         teensy_layout.addStretch(1)
 
         form.addRow(self.openephys_enabled_checkbox)
@@ -580,13 +595,14 @@ class MainWindow(QMainWindow):
         self.openephys_host_edit.setText(openephys.host)
         self.openephys_port_spin.setValue(openephys.port)
         
-        # Set serial port and pulse frequency
+        # Set serial port, trigger FPS, and pulse frequency
         if openephys.serial_port:
             index = self.teensy_serial_combo.findText(openephys.serial_port)
             if index >= 0:
                 self.teensy_serial_combo.setCurrentIndex(index)
             else:
                 self.teensy_serial_combo.setCurrentText(openephys.serial_port)
+        self.trigger_fps_spin.setValue(openephys.trigger_fps)
 
         # Configure OpenEphys controller
         self.openephys_controller.enabled = openephys.enabled
@@ -671,18 +687,14 @@ class MainWindow(QMainWindow):
         )
 
     def _openephys_settings_from_ui(self) -> OpenEphysSettings:
-        # Get pulse frequency from active camera FPS
-        pulse_frequency = 100.0  # Default fallback
-        if self._config.multi_camera.cameras:
-            # Use first camera
-            pulse_frequency = int(self._config.multi_camera.cameras[0].fps)
-        
+        trigger_fps = self.trigger_fps_spin.value()
         return OpenEphysSettings(
             enabled=self.openephys_enabled_checkbox.isChecked(),
             host=self.openephys_host_edit.text().strip() or "localhost",
             port=self.openephys_port_spin.value(),
             serial_port=self.teensy_serial_combo.currentText().strip(),
-            pulse_frequency=pulse_frequency,
+            pulse_frequency=trigger_fps,  # Teensy pulse freq = trigger FPS
+            trigger_fps=trigger_fps,
         )
 
     # ------------------------------------------------------------------ actions
@@ -1081,11 +1093,14 @@ class MainWindow(QMainWindow):
 
         # If hardware triggering is enabled, synchronize camera settings
         if self.openephys_enabled_checkbox.isChecked():
-            reference_fps = active_cams[0].fps
+            trigger_fps = self.trigger_fps_spin.value()
+            # Set camera internal frame rate ABOVE trigger rate to prevent
+            # the camera's rate limiter from dropping triggered frames.
+            camera_fps = trigger_fps + 50.0
             
-            # Synchronize all cameras to same framerate
+            # Synchronize all cameras
             for cam in active_cams:
-                cam.fps = reference_fps
+                cam.fps = camera_fps  # Internal rate above trigger rate
                 
                 # Enable hardware triggering only for backends that support it
                 # (gentl and basler support hardware triggering, opencv does not)
@@ -1103,7 +1118,10 @@ class MainWindow(QMainWindow):
                         f"camera will run in freerun mode"
                     )
             
-            logging.info(f"Hardware triggering enabled: all cameras synchronized to {reference_fps:.2f} FPS")
+            logging.info(
+                f"Hardware triggering: trigger_fps={trigger_fps:.1f} Hz, "
+                f"camera internal fps={camera_fps:.1f} (rate limiter headroom)"
+            )
 
         # Determine if we're in single or multi-camera mode
         self._multi_camera_mode = len(active_cams) > 1
@@ -1640,24 +1658,15 @@ class MainWindow(QMainWindow):
 
     def _sync_openephys_controller_from_ui(self) -> None:
         """Sync OpenEphys controller configuration from UI values."""
-        # Get pulse frequency from active camera FPS
-        pulse_frequency = 100.0  # Default fallback
-        if self._config.multi_camera.cameras:
-            # Use DLC camera if specified, otherwise first camera
-            if hasattr(self._config.multi_camera, "dlc_camera_id"):
-                for cam in self._config.multi_camera.cameras:
-                    if get_camera_id(cam) == self._config.multi_camera.dlc_camera_id:
-                        pulse_frequency = float(cam.fps)
-                        break
-            else:
-                pulse_frequency = float(self._config.multi_camera.cameras[0].fps)
+        # Use trigger FPS from the dedicated spinbox as the Teensy pulse frequency
+        trigger_fps = self.trigger_fps_spin.value()
         
         self.openephys_controller.enabled = self.openephys_enabled_checkbox.isChecked()
         self.openephys_controller.configure(
             host=self.openephys_host_edit.text().strip() or "localhost",
             port=self.openephys_port_spin.value(),
             serial_port=self.teensy_serial_combo.currentText().strip(),
-            pulse_frequency=pulse_frequency,
+            pulse_frequency=trigger_fps,
         )
 
     def _on_openephys_error(self, message: str) -> None:

@@ -727,7 +727,15 @@ class GenTLCameraBackend(CameraBackend):
 
         target = float(self.settings.fps)
 
-        # Try to enable frame rate control
+        # In trigger mode, ensure the camera's internal frame rate is set
+        # ABOVE the external trigger rate so the rate limiter never drops
+        # triggered frames.  The caller should already have set fps to
+        # trigger_fps + headroom, but we log clearly either way.
+        is_trigger = self._trigger_mode in (
+            "triggered", "trigger", "on", "external", "hardware"
+        )
+
+        # Try to enable frame rate control  (needed to write the value)
         for attr in ("AcquisitionFrameRateEnable", "AcquisitionFrameRateControlEnable"):
             try:
                 getattr(node_map, attr).value = True
@@ -748,7 +756,13 @@ class GenTLCameraBackend(CameraBackend):
                 if abs(actual - target) > 0.1:
                     LOG.warning(f"FPS mismatch: requested {target:.2f}, got {actual:.2f}")
                 else:
-                    LOG.info(f"Frame rate set to {actual:.2f} FPS")
+                    if is_trigger:
+                        LOG.info(
+                            f"Frame rate set to {actual:.2f} FPS "
+                            f"(above trigger rate to avoid rate limiting)"
+                        )
+                    else:
+                        LOG.info(f"Frame rate set to {actual:.2f} FPS")
                 return
             except Exception as e:
                 LOG.warning(f"Failed to set frame rate via {attr}: {e}")

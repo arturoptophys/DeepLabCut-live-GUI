@@ -166,6 +166,7 @@ class OpenEphysSettings:
     port: int = 37497
     serial_port: str = ""  # COM port for Teensy (e.g., "COM3")
     pulse_frequency: float = 100.0  # Pulse frequency in Hz
+    trigger_fps: float = 100.0  # Desired trigger frame rate (Hz). Camera FPS will be set higher to avoid rate limiting.
 
 
 @dataclass
